@@ -58,15 +58,23 @@ start_daemon() {
     sleep 3
 }
 
-# Initial bring-up. Only pass flags the user has an explicit opinion about,
-# so we don't reset tailscaled's persisted preferences on every restart.
-# tailscale up with no overriding flags keeps whatever state was saved.
+# Manifest defaults for accept_dns / accept_routes. We always apply these on
+# bring_up because the original tailscale.sh hardcoded them, and front-panel
+# users who never touch the Rinkhals Web portal would otherwise silently
+# regress (Tailscale's built-in default for accept_routes is false, which
+# breaks subnet-routing scenarios that worked before). The other new
+# settings (ssh, hostname, advertise_exit_node) only apply on explicit user
+# override, because tailscaled's persisted preference is the right fallback
+# when the user has no opinion.
+DEFAULT_ACCEPT_DNS=false
+DEFAULT_ACCEPT_ROUTES=true
+
 bring_up() {
     UP_ARGS=""
     [ -n "$USER_SSH" ]       && UP_ARGS="$UP_ARGS --ssh=$USER_SSH"
     [ -n "$USER_HOSTNAME" ]  && UP_ARGS="$UP_ARGS --hostname=$USER_HOSTNAME"
-    [ -n "$USER_DNS" ]       && UP_ARGS="$UP_ARGS --accept-dns=$USER_DNS"
-    [ -n "$USER_ROUTES" ]    && UP_ARGS="$UP_ARGS --accept-routes=$USER_ROUTES"
+    UP_ARGS="$UP_ARGS --accept-dns=${USER_DNS:-$DEFAULT_ACCEPT_DNS}"
+    UP_ARGS="$UP_ARGS --accept-routes=${USER_ROUTES:-$DEFAULT_ACCEPT_ROUTES}"
     [ "$USER_EXIT_NODE" = "true" ] && UP_ARGS="$UP_ARGS --advertise-exit-node"
 
     log "tailscale up $UP_ARGS"
