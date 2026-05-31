@@ -8,7 +8,7 @@ mkdir /work
 cd /work
 
 
-OCTOEVERYWHERE_VERSION=4.1.0
+OCTOEVERYWHERE_VERSION=5.0.2
 OCTOEVERYWHERE_DIRECTORY=/apps/octoeverywhere
 
 

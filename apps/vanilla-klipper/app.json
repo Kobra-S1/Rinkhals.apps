@@ -3,5 +3,11 @@
 
     "name": "Klipper (vanilla)",
     "description": "Vanilla Klipper to replace Anycubic GoKlipper reimplementation",
-    "version": "0.1"
+    "version": "0.1",
+
+    "upstream": {
+        "type": "github-branch-head",
+        "repo": "Klipper3d/klipper",
+        "branch": "master"
+    }
 }
