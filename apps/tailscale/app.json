@@ -18,9 +18,51 @@
     },
 
     "properties": {
+        "status": {
+            "display": "Tailscale status",
+            "type": "report"
+        },
+
         "account_login": {
             "display": "Connect to Tailscale",
             "type": "qr"
+        },
+
+        "ssh_enabled": {
+            "display": "Tailscale SSH",
+            "type": "enum",
+            "options": ["False", "True"],
+            "default": "False"
+        },
+
+        "hostname": {
+            "display": "Hostname on tailnet",
+            "type": "text",
+            "default": ""
+        },
+
+        "advertise_exit_node": {
+            "display": "Advertise this printer as a tailnet exit node",
+            "type": "enum",
+            "options": ["False", "True"],
+            "default": "False",
+            "advanced": true
+        },
+
+        "accept_dns": {
+            "display": "Accept Tailscale's DNS",
+            "type": "enum",
+            "options": ["False", "True"],
+            "default": "False",
+            "advanced": true
+        },
+
+        "accept_routes": {
+            "display": "Accept routes from other tailnet peers",
+            "type": "enum",
+            "options": ["False", "True"],
+            "default": "True",
+            "advanced": true
         }
     }
 }
