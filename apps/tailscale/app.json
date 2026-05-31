@@ -3,18 +3,25 @@
 
     "name": "Tailscale",
     "description": "Secure, private network connectivity using Tailscale VPN",
-    "version": "1.84.0",
+    "version": "1.98.3",
     "depends": [],
+
+    "upstream": {
+        "type": "github-release",
+        "repo": "tailscale/tailscale",
+        "strip_prefix": "v"
+    },
 
     "requirements": {
         "cpu": 5,
         "memory": 20
     },
-    
+
     "properties": {
         "account_login": {
             "display": "Connect to Tailscale",
-            "type": "qr"
+            "type": "qr",
+            "advanced": true
         }
     }
 }
