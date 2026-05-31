@@ -17,8 +17,7 @@
     "properties": {
         "printer_link": {
             "display": "Link your printer",
-            "type": "qr",
-            "advanced": true
+            "type": "qr"
         }
     }
 }
