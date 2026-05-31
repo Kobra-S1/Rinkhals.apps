@@ -3,31 +3,43 @@
 . /useremain/rinkhals/.current/tools.sh
 
 # ---------------------------------------------------------------------------
-# Read writable user properties. These mirror the editable fields in the
-# Rinkhals Web Configure drawer; defaults come from app.json's "default"
-# entries via get_app_property when the user hasn't set a value.
+# Read writable settings the user has *explicitly* set via the Rinkhals Web
+# Configure drawer. We deliberately bypass get_app_property here because that
+# helper falls through to the manifest default - and if we then "applied" the
+# default to tailscaled, we'd clobber whatever the daemon had persisted from
+# a previous session. The rule is:
+#
+#   user explicitly set -> apply
+#   user not set         -> leave daemon alone
+#
+# A missing/empty value here means "user has no opinion".
 # ---------------------------------------------------------------------------
 
-# Map our "True"/"False" enum values to the literals Tailscale's CLI expects.
+USER_CONFIG=/useremain/home/rinkhals/apps/tailscale.config
+
 bool_for_cli() {
     case "$1" in
         True|true|1|yes) echo "true" ;;
-        *) echo "false" ;;
+        False|false|0|no) echo "false" ;;
+        *) echo "" ;;
     esac
 }
 
+read_override() {
+    [ -f "$USER_CONFIG" ] || { echo ""; return; }
+    jq -r --arg k "$1" '.[$k] // empty' "$USER_CONFIG" 2>/dev/null
+}
+
 read_user_settings() {
-    SSH_ENABLED=$(bool_for_cli "$(get_app_property tailscale ssh_enabled)")
-    USER_HOSTNAME=$(get_app_property tailscale hostname)
-    ADVERTISE_EXIT_NODE=$(bool_for_cli "$(get_app_property tailscale advertise_exit_node)")
-    ACCEPT_DNS=$(bool_for_cli "$(get_app_property tailscale accept_dns)")
-    ACCEPT_ROUTES=$(bool_for_cli "$(get_app_property tailscale accept_routes)")
+    USER_SSH=$(bool_for_cli "$(read_override ssh_enabled)")
+    USER_HOSTNAME=$(read_override hostname)
+    USER_EXIT_NODE=$(bool_for_cli "$(read_override advertise_exit_node)")
+    USER_DNS=$(bool_for_cli "$(read_override accept_dns)")
+    USER_ROUTES=$(bool_for_cli "$(read_override accept_routes)")
 }
 
 # ---------------------------------------------------------------------------
-# Bring the daemon up. We always pass the current settings on the initial
-# `tailscale up` call, then use `tailscale set` for any subsequent changes
-# the user makes via the web portal.
+# Daemon lifecycle.
 # ---------------------------------------------------------------------------
 
 tailscale_cli() {
@@ -46,22 +58,24 @@ start_daemon() {
     sleep 3
 }
 
+# Initial bring-up. Only pass flags the user has an explicit opinion about,
+# so we don't reset tailscaled's persisted preferences on every restart.
+# tailscale up with no overriding flags keeps whatever state was saved.
 bring_up() {
-    UP_ARGS="--accept-dns=$ACCEPT_DNS --accept-routes=$ACCEPT_ROUTES --ssh=$SSH_ENABLED"
-    if [ -n "$USER_HOSTNAME" ]; then
-        UP_ARGS="$UP_ARGS --hostname=$USER_HOSTNAME"
-    fi
-    if [ "$ADVERTISE_EXIT_NODE" = "true" ]; then
-        UP_ARGS="$UP_ARGS --advertise-exit-node"
-    fi
+    UP_ARGS=""
+    [ -n "$USER_SSH" ]       && UP_ARGS="$UP_ARGS --ssh=$USER_SSH"
+    [ -n "$USER_HOSTNAME" ]  && UP_ARGS="$UP_ARGS --hostname=$USER_HOSTNAME"
+    [ -n "$USER_DNS" ]       && UP_ARGS="$UP_ARGS --accept-dns=$USER_DNS"
+    [ -n "$USER_ROUTES" ]    && UP_ARGS="$UP_ARGS --accept-routes=$USER_ROUTES"
+    [ "$USER_EXIT_NODE" = "true" ] && UP_ARGS="$UP_ARGS --advertise-exit-node"
 
     log "tailscale up $UP_ARGS"
     tailscale_cli up $UP_ARGS >> "$TAILSCALE_LOG_FILE" 2>&1 &
 }
 
-# Apply a single setting at runtime. Tailscale persists these in tailscaled's
-# state so they survive restarts. We compare against what's already in effect
-# (cached in APPLIED_*) so we don't spam the CLI every poll.
+# Apply runtime changes that arrive while the daemon is running. We compare
+# each setting against the last value we applied so we don't spam the CLI
+# every poll when nothing has changed.
 APPLIED_SSH=""
 APPLIED_HOSTNAME=""
 APPLIED_EXIT_NODE=""
@@ -69,46 +83,44 @@ APPLIED_DNS=""
 APPLIED_ROUTES=""
 
 apply_runtime_changes() {
-    if [ "$SSH_ENABLED" != "$APPLIED_SSH" ]; then
-        log "applying ssh=$SSH_ENABLED"
-        tailscale_cli set --ssh="$SSH_ENABLED" >> "$TAILSCALE_LOG_FILE" 2>&1 \
-            && APPLIED_SSH="$SSH_ENABLED"
+    if [ -n "$USER_SSH" ] && [ "$USER_SSH" != "$APPLIED_SSH" ]; then
+        log "applying ssh=$USER_SSH"
+        tailscale_cli set --ssh="$USER_SSH" >> "$TAILSCALE_LOG_FILE" 2>&1 \
+            && APPLIED_SSH="$USER_SSH"
     fi
-    if [ "$USER_HOSTNAME" != "$APPLIED_HOSTNAME" ] && [ -n "$USER_HOSTNAME" ]; then
+    if [ -n "$USER_HOSTNAME" ] && [ "$USER_HOSTNAME" != "$APPLIED_HOSTNAME" ]; then
         log "applying hostname=$USER_HOSTNAME"
         tailscale_cli set --hostname="$USER_HOSTNAME" >> "$TAILSCALE_LOG_FILE" 2>&1 \
             && APPLIED_HOSTNAME="$USER_HOSTNAME"
     fi
-    if [ "$ADVERTISE_EXIT_NODE" != "$APPLIED_EXIT_NODE" ]; then
-        log "applying advertise-exit-node=$ADVERTISE_EXIT_NODE"
-        tailscale_cli set --advertise-exit-node="$ADVERTISE_EXIT_NODE" >> "$TAILSCALE_LOG_FILE" 2>&1 \
-            && APPLIED_EXIT_NODE="$ADVERTISE_EXIT_NODE"
+    if [ -n "$USER_EXIT_NODE" ] && [ "$USER_EXIT_NODE" != "$APPLIED_EXIT_NODE" ]; then
+        log "applying advertise-exit-node=$USER_EXIT_NODE"
+        tailscale_cli set --advertise-exit-node="$USER_EXIT_NODE" >> "$TAILSCALE_LOG_FILE" 2>&1 \
+            && APPLIED_EXIT_NODE="$USER_EXIT_NODE"
     fi
-    if [ "$ACCEPT_DNS" != "$APPLIED_DNS" ]; then
-        log "applying accept-dns=$ACCEPT_DNS"
-        tailscale_cli set --accept-dns="$ACCEPT_DNS" >> "$TAILSCALE_LOG_FILE" 2>&1 \
-            && APPLIED_DNS="$ACCEPT_DNS"
+    if [ -n "$USER_DNS" ] && [ "$USER_DNS" != "$APPLIED_DNS" ]; then
+        log "applying accept-dns=$USER_DNS"
+        tailscale_cli set --accept-dns="$USER_DNS" >> "$TAILSCALE_LOG_FILE" 2>&1 \
+            && APPLIED_DNS="$USER_DNS"
     fi
-    if [ "$ACCEPT_ROUTES" != "$APPLIED_ROUTES" ]; then
-        log "applying accept-routes=$ACCEPT_ROUTES"
-        tailscale_cli set --accept-routes="$ACCEPT_ROUTES" >> "$TAILSCALE_LOG_FILE" 2>&1 \
-            && APPLIED_ROUTES="$ACCEPT_ROUTES"
+    if [ -n "$USER_ROUTES" ] && [ "$USER_ROUTES" != "$APPLIED_ROUTES" ]; then
+        log "applying accept-routes=$USER_ROUTES"
+        tailscale_cli set --accept-routes="$USER_ROUTES" >> "$TAILSCALE_LOG_FILE" 2>&1 \
+            && APPLIED_ROUTES="$USER_ROUTES"
     fi
 }
 
 # ---------------------------------------------------------------------------
-# Status publishing. We poll `tailscale status --json`, extract the handful
-# of fields the Rinkhals Web portal cares about into a compact JSON blob,
-# and write it under the "status" property in the temp-config file the
-# portal already polls for property values.
+# Status publishing. We poll both `tailscale status --json` (for connection
+# state, peer info, IPs) and `tailscale debug prefs` (for the SSH/DNS/routes
+# preferences actually in effect on this node). Capabilities listed in the
+# status output reflect what the tailnet ACL grants this node, NOT whether
+# the node is offering the feature; prefs are the ground truth.
 # ---------------------------------------------------------------------------
 
 CONFIG_DIR=/tmp/rinkhals/apps
 CONFIG_FILE="$CONFIG_DIR/tailscale.config"
 
-# Write a single property into the temp config file. Use jq --arg so we
-# don't have to worry about embedded quotes in the value (the status blob
-# is itself a JSON string and would break a shell-interpolated jq expression).
 write_temp_property() {
     local key=$1 value=$2
     mkdir -p "$CONFIG_DIR"
@@ -120,29 +132,32 @@ write_temp_property() {
 }
 
 publish_status() {
-    local raw status_json
-    raw=$(tailscale_cli status --json 2>/dev/null)
-    if [ -n "$raw" ]; then
-        status_json=$(echo "$raw" | jq -c '{
-            state: (.BackendState // "Unknown"),
-            tailnet_ip: ((.TailscaleIPs // [])[0] // ""),
-            magic_dns: (if (.MagicDNSSuffix // "") == "" then ""
-                else ((.Self.HostName // "") + "." + .MagicDNSSuffix) end),
-            tailnet_name: (.CurrentTailnet.Name // ""),
-            hostname: (.Self.HostName // ""),
-            ssh: (.Self.Capabilities // [] | any(. == "https://tailscale.com/cap/ssh")),
-            exit_node: (.Self.ExitNodeOption // false),
-            online: (.Self.Online // false),
-            peer_count: ((.Peer // {}) | length)
-        }' 2>/dev/null)
+    local s p status_json
+    s=$(tailscale_cli status --json 2>/dev/null)
+    p=$(tailscale_cli debug prefs 2>/dev/null)
+
+    if [ -n "$s" ] && [ -n "$p" ]; then
+        status_json=$(jq -nc \
+            --argjson s "$s" --argjson p "$p" \
+            '{
+                state: ($s.BackendState // "Unknown"),
+                tailnet_ip: (($s.TailscaleIPs // [])[0] // ""),
+                magic_dns: (if ($s.MagicDNSSuffix // "") == "" then ""
+                            else (($s.Self.HostName // "") + "." + $s.MagicDNSSuffix) end),
+                tailnet_name: ($s.CurrentTailnet.Name // ""),
+                hostname: ($s.Self.HostName // ""),
+                ssh: ($p.RunSSH // false),
+                exit_node: (($p.AdvertiseRoutes // []) != [] or ($s.Self.ExitNodeOption // false)),
+                accept_dns: ($p.CorpDNS // false),
+                accept_routes: ($p.RouteAll // false),
+                online: ($s.Self.Online // false),
+                peer_count: (($s.Peer // {}) | length)
+            }' 2>/dev/null)
     fi
     [ -z "$status_json" ] && status_json='{"state":"Unknown"}'
     write_temp_property status "$status_json"
 }
 
-# Scrape the daemon log for a login URL. Tailscale only prints it while
-# unauthenticated; once logged in this loop quickly stops finding new ones,
-# which is fine - the existing value in the temp config stays put.
 publish_login_url() {
     local line url
     line=$(tail -n 30 "$TAILSCALE_LOG_FILE" 2>/dev/null | grep https://login.tailscale.com | tail -n 1)
@@ -162,13 +177,11 @@ read_user_settings
 start_daemon
 bring_up
 
-# Seed the "applied" cache with what we just passed to `tailscale up` so the
-# first apply_runtime_changes pass is a no-op.
-APPLIED_SSH="$SSH_ENABLED"
+APPLIED_SSH="$USER_SSH"
 APPLIED_HOSTNAME="$USER_HOSTNAME"
-APPLIED_EXIT_NODE="$ADVERTISE_EXIT_NODE"
-APPLIED_DNS="$ACCEPT_DNS"
-APPLIED_ROUTES="$ACCEPT_ROUTES"
+APPLIED_EXIT_NODE="$USER_EXIT_NODE"
+APPLIED_DNS="$USER_DNS"
+APPLIED_ROUTES="$USER_ROUTES"
 
 while true; do
     read_user_settings
