@@ -13,11 +13,15 @@ status() {
 }
 start() {
     stop
-    
+
     cd $APP_ROOT
-    python ./cloud2lan-bridge.py &
+
+    chmod +x cloud2lan-bridge.sh
+    ./cloud2lan-bridge.sh &
 }
 stop() {
+    # Kill the supervisor first so it doesn't immediately respawn the python.
+    kill_by_name cloud2lan-bridge.sh
     kill_by_name cloud2lan-bridge.py
 }
 
