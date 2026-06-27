@@ -3,7 +3,7 @@
 
     "name": "NFS Mount",
     "description": "Replace local gcode storage with NFS to offload I/O",
-    "version": "0.1",
+    "version": "0.2",
 
     "properties": {
         "server": {
