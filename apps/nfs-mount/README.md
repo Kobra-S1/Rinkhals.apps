@@ -8,13 +8,18 @@ Replace local gcode storage with NFS to offload I/O operations from the printer'
 - Supports both `/userdata/app/gk/printer_data/gcodes` and `/useremain/app/gk/gcodes` directories
 - Automatically unmounts and remounts local filesystems when starting/stopping
 - Configurable NFS server, port, and share path
-- Skips mounting if using placeholder defaults (requires configuration)
+- Mounts in the background and retries until the NFS server is reachable, so it survives the boot startup timeout and a network that is not yet up
+- Skips mounting until configured (the NFS server and share must be set)
 
 ## Configuration
 
-- `server`: NFS server IP address (default: 192.168.1.100)
+The app must be configured before it will mount. Set the NFS server and share
+in the Rinkhals UI (or via the app's config), otherwise it starts but skips
+mounting and local storage is left in place.
+
+- `server`: NFS server IP address (no default; required)
 - `port`: NFS port (default: 2049)
-- `share`: NFS share path (default: /mnt/share)
+- `share`: NFS share path (no default; required)
 
 ## Installation
 
