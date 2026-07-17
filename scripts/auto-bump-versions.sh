@@ -91,12 +91,19 @@ for manifest in "$APPS_DIR"/*/app.json; do
     continue
   fi
 
-  if [ "$pinned" = "$upstream" ]; then
-    note "up to date ($pinned)"
+  # The store shows the committed app.json version, so it must track upstream
+  # too - not just the get-script pin. Bump if either has drifted (an app whose
+  # get-script is current but whose app.json lags would otherwise never be fixed
+  # and would show "behind upstream" forever).
+  manifest_ver=$(jq -r '.version // empty' "$manifest")
+  from=${manifest_ver:-$pinned}
+
+  if [ "$pinned" = "$upstream" ] && [ "$manifest_ver" = "$upstream" ]; then
+    note "up to date ($upstream)"
     continue
   fi
 
-  log "$app: $pinned -> $upstream"
+  log "$app: $from -> $upstream"
 
   branch_name="chore/auto-bump-$app-$upstream"
 
@@ -138,8 +145,15 @@ for manifest in "$APPS_DIR"/*/app.json; do
   sed -i.bak -E "s|^([[:space:]]*[A-Z_]+VERSION=).*|\1$replacement|" "$get_script"
   rm -f "$get_script.bak"
 
-  git add "$get_script"
-  git commit --quiet -m "chore($app): auto-bump $pinned -> $upstream
+  # Also bump the committed app.json version. The store reads this value from
+  # the repo at the release tag and compares it to upstream; without bumping it
+  # here the app shows "behind upstream" forever even after the get-script bump.
+  # The "$version" schema key is not matched by this pattern (no ": \"x\"" form).
+  sed -i.bak "s/\"version\": *\"[^\"]*\"/\"version\": \"$upstream\"/" "$manifest"
+  rm -f "$manifest.bak"
+
+  git add "$get_script" "$manifest"
+  git commit --quiet -m "chore($app): auto-bump $from -> $upstream
 
 Resolved from $(jq -r '.upstream.type' "$manifest") at $repo."
 
@@ -150,7 +164,7 @@ Auto-bump from the upstream-tracking bot.
 
 | app | from | to | source |
 |---|---|---|---|
-| $app | \`$pinned\` | \`$upstream\` | $type \`$repo\` |
+| $app | \`$from\` | \`$upstream\` | $type \`$repo\` |
 
 This PR was opened by \`scripts/auto-bump-versions.sh\`. Merging will trigger a
 rebuild of the affected SWUs on the next Rinkhals.Apps release. If you don't
@@ -160,7 +174,7 @@ updated or removed.
 EOF
 )
   gh pr create --base master --head "$branch_name" \
-    --title "chore($app): auto-bump $pinned -> $upstream" \
+    --title "chore($app): auto-bump $from -> $upstream" \
     --body "$body" >&2
   opened=$((opened + 1))
 done
