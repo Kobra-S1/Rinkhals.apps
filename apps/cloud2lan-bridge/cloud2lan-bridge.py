@@ -1,6 +1,7 @@
 import os
+import sys
+import socket
 import configparser
-import base64
 import subprocess
 import hashlib
 import json
@@ -19,7 +20,7 @@ LOG_INFO = 1
 LOG_WARNING = 2
 LOG_ERROR = 3
 
-LOG_LEVEL = LOG_DEBUG if not not os.getenv('DEBUG') else LOG_INFO
+LOG_LEVEL = LOG_DEBUG if os.getenv('DEBUG') else LOG_INFO
 
 
 def log(level, message):
@@ -29,6 +30,45 @@ def md5(input: str) -> str:
     return hashlib.md5(input.encode('utf-8')).hexdigest()
 def now() -> int:
     return round(time.time() * 1000)
+
+
+def wait_for_file(path: str, timeout: float = 120.0, poll_interval: float = 1.0) -> bool:
+    """
+    Block until `path` exists. Returns True if it appeared within `timeout`
+    seconds, False on timeout.
+
+    Apps can start before the stock Anycubic firmware has finished laying
+    down its config files in /userdata/app/gk/config and the boot-time
+    descriptors in /useremain/dev/. Reading them eagerly in __init__ races
+    that boot sequence and was the main reason cloud2lan-bridge "didn't
+    start sometimes."
+    """
+    deadline = time.time() + timeout
+    while not os.path.exists(path):
+        if time.time() >= deadline:
+            return False
+        time.sleep(poll_interval)
+    return True
+
+def wait_for_tcp(host: str, port: int, timeout: float = 120.0, poll_interval: float = 1.0) -> bool:
+    """
+    Block until host:port accepts a TCP connection. Returns True if reachable
+    within `timeout` seconds, False on timeout.
+
+    Used to gate the LAN MQTT connect on gklib's local broker actually being
+    up. Connecting before the broker has bound the port produces a
+    ConnectionRefusedError that, under the previous code, propagated out to
+    main() and SIGKILLed the process with no respawn.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=2.0):
+                return True
+        except (OSError, socket.timeout):
+            if time.time() >= deadline:
+                return False
+            time.sleep(poll_interval)
 
 
 class Program:
@@ -48,6 +88,21 @@ class Program:
     lan_client = None
 
     def __init__(self):
+        # Wait for the boot-time files we depend on. The stock Anycubic
+        # firmware writes these as part of its startup; if Rinkhals brings
+        # this app up before that's done, eager reads explode.
+        required_files = [
+            '/userdata/app/gk/config/device.ini',
+            '/userdata/app/gk/config/api.cfg',
+            '/userdata/app/gk/config/device_account.json',
+            '/useremain/dev/version',
+            '/useremain/dev/device_id',
+        ]
+        for path in required_files:
+            log(LOG_INFO, f'Waiting for {path}...')
+            if not wait_for_file(path, timeout=120):
+                raise RuntimeError(f'Timed out waiting for {path}')
+
         self.cloud_config = self.get_cloud_config()
         self.api_config = self.get_api_config()
 
@@ -79,7 +134,7 @@ class Program:
         cert_file = f'{cert_path}/deviceCrt'
         key_file = f'{cert_path}/devicePk'
         ca_file = f'{cert_path}/caCrt'
-        
+
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ssl_context.set_ciphers(('ALL:@SECLEVEL=0'),)
         if cert_file and key_file:
@@ -126,7 +181,7 @@ class Program:
 
         response = topic.endswith('/response')
         report = topic.endswith('/report')
-        
+
         if not response:
             if report:
                 log(LOG_INFO, f'[{mode}] Sent report for {payload.get("type")}/{payload.get("action")}')
@@ -148,7 +203,7 @@ class Program:
             self.send_message(self.lan_client, topic.replace(self.cloud_device_id, self.lan_device_id), payload)
     def on_lan_message(self, topic, payload):
         log(LOG_DEBUG, f'[lan] Received {topic} = {str(payload)}')
- 
+
         if not topic.endswith('/response'):
             if topic.endswith('/report'):
                 log(LOG_INFO, f'[lan] Received report for {payload.get("type")}/{payload.get("action")}')
@@ -166,12 +221,21 @@ class Program:
             log(LOG_INFO, '[cloud] Connected')
             self.cloud_client.subscribe(f'anycubic/anycubicCloud/v1/+/printer/{self.model_id}/{self.cloud_device_id}/#')
         def mqtt_on_connect_fail(client, userdata):
-            log(LOG_INFO, '[cloud] Failed to connect')
+            log(LOG_WARNING, '[cloud] Failed to connect')
+        def mqtt_on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+            log(LOG_WARNING, f'[cloud] Disconnected (reason: {reason_code}); paho will retry')
         def mqtt_on_log(client, userdata, level, buf):
             #log(LOG_DEBUG, buf)
             pass
         def mqtt_on_message(client, userdata, msg):
-            self.on_cloud_message(msg.topic, json.loads(msg.payload.decode("utf-8")))
+            # Wrap in try/except so a single malformed payload doesn't kill
+            # the callback path. paho catches the exception and continues,
+            # but the message is lost; logging it makes debugging tractable.
+            try:
+                payload = json.loads(msg.payload.decode("utf-8"))
+                self.on_cloud_message(msg.topic, payload)
+            except Exception as e:
+                log(LOG_ERROR, f'[cloud] Failed to handle {msg.topic}: {e}')
 
         mqtt_broker_endpoint = urllib.parse.urlparse(mqtt_broker)
 
@@ -184,28 +248,63 @@ class Program:
 
         self.cloud_client.on_connect = mqtt_on_connect
         self.cloud_client.on_connect_fail = mqtt_on_connect_fail
+        self.cloud_client.on_disconnect = mqtt_on_disconnect
         self.cloud_client.on_message = mqtt_on_message
         self.cloud_client.on_log = mqtt_on_log
 
         self.cloud_client.username_pw_set(mqtt_username, mqtt_password)
-        self.cloud_client.connect(mqtt_broker_endpoint.hostname, mqtt_broker_endpoint.port or 1883)
-        self.cloud_client.loop_start()
 
+        # Retry with exponential backoff. Network may not be up yet at boot,
+        # DNS may not be ready, the cert may not be loaded, etc. Fail loudly
+        # only after multiple attempts.
+        last_err = None
+        for attempt in range(8):
+            try:
+                self.cloud_client.connect(mqtt_broker_endpoint.hostname, mqtt_broker_endpoint.port or 1883)
+                self.cloud_client.loop_start()
+                break
+            except Exception as e:
+                last_err = e
+                wait = min(60, 2 ** attempt)
+                log(LOG_WARNING, f'[cloud] Connect attempt {attempt+1} failed: {e}; retrying in {wait}s')
+                time.sleep(wait)
+        else:
+            raise RuntimeError(f'Could not connect to cloud MQTT after 8 attempts: {last_err}')
+
+        # Bounded wait for CONNACK so we don't hang forever on a half-open
+        # connection where TCP completed but the broker never replied.
+        deadline = time.time() + 30
         while not self.cloud_client.is_connected():
+            if time.time() >= deadline:
+                raise RuntimeError('Cloud MQTT TCP connected but never got CONNACK')
             time.sleep(0.25)
     def connect_lan_mqtt(self):
+        # Wait for gklib's local broker to be reachable. This is by far the
+        # most common race at boot: the bridge starts in parallel with the
+        # Anycubic stack and gklib hasn't bound port 9883 yet.
+        log(LOG_INFO, '[lan] Waiting for local MQTT broker on 127.0.0.1:9883...')
+        if not wait_for_tcp('127.0.0.1', 9883, timeout=120):
+            raise RuntimeError('Timed out waiting for local MQTT broker (gklib not up?)')
+        log(LOG_INFO, '[lan] Local MQTT broker is reachable')
+
         mqtt_username, mqtt_password = self.get_lan_mqtt_credentials()
 
         def mqtt_on_connect(client, userdata, connect_flags, reason_code, properties):
             log(LOG_INFO, '[lan] Connected')
             self.lan_client.subscribe(f'anycubic/anycubicCloud/v1/printer/public/{self.model_id}/{self.lan_device_id}/#')
         def mqtt_on_connect_fail(client, userdata):
-            log(LOG_INFO, '[lan] Failed to connect')
+            log(LOG_WARNING, '[lan] Failed to connect')
+        def mqtt_on_disconnect(client, userdata, disconnect_flags, reason_code, properties):
+            log(LOG_WARNING, f'[lan] Disconnected (reason: {reason_code}); paho will retry')
         def mqtt_on_log(client, userdata, level, buf):
             #log(LOG_DEBUG, buf)
             pass
         def mqtt_on_message(client, userdata, msg):
-            self.on_lan_message(msg.topic, json.loads(msg.payload.decode("utf-8")))
+            try:
+                payload = json.loads(msg.payload.decode("utf-8"))
+                self.on_lan_message(msg.topic, payload)
+            except Exception as e:
+                log(LOG_ERROR, f'[lan] Failed to handle {msg.topic}: {e}')
 
         self.lan_client = mqtt.Client(protocol=mqtt.MQTTv5, client_id=self.lan_device_id)
         self.lan_client.enable_logger()
@@ -215,16 +314,35 @@ class Program:
 
         self.lan_client.on_connect = mqtt_on_connect
         self.lan_client.on_connect_fail = mqtt_on_connect_fail
+        self.lan_client.on_disconnect = mqtt_on_disconnect
         self.lan_client.on_message = mqtt_on_message
         self.lan_client.on_log = mqtt_on_log
 
         self.lan_client.username_pw_set(mqtt_username, mqtt_password)
-        self.lan_client.connect('127.0.0.1', 9883)
-        self.lan_client.loop_start()
 
+        # Retry the actual connect even though we just confirmed the port
+        # is open. There's a small window where gklib has the TCP socket
+        # listening but isn't fully processing CONNECT packets yet.
+        last_err = None
+        for attempt in range(8):
+            try:
+                self.lan_client.connect('127.0.0.1', 9883)
+                self.lan_client.loop_start()
+                break
+            except Exception as e:
+                last_err = e
+                wait = min(60, 2 ** attempt)
+                log(LOG_WARNING, f'[lan] Connect attempt {attempt+1} failed: {e}; retrying in {wait}s')
+                time.sleep(wait)
+        else:
+            raise RuntimeError(f'Could not connect to local MQTT after 8 attempts: {last_err}')
+
+        deadline = time.time() + 30
         while not self.lan_client.is_connected():
+            if time.time() >= deadline:
+                raise RuntimeError('Local MQTT TCP connected but never got CONNACK')
             time.sleep(0.25)
-    
+
     def main(self):
 
         self.connect_cloud_mqtt()
@@ -272,8 +390,15 @@ class Program:
         }
         self.send_message(self.cloud_client, f'anycubic/anycubicCloud/v1/printer/public/{self.model_id}/{self.cloud_device_id}/ota/report', payload)
 
+        # Heartbeat loop. Logging the connection state every few minutes
+        # makes it possible to tell from the app log whether the bridge is
+        # actually alive and which side dropped if something stops working.
+        HEARTBEAT_INTERVAL = 300
         while True:
-            time.sleep(1)
+            time.sleep(HEARTBEAT_INTERVAL)
+            cloud_ok = self.cloud_client.is_connected() if self.cloud_client else False
+            lan_ok = self.lan_client.is_connected() if self.lan_client else False
+            log(LOG_INFO, f'[heartbeat] cloud={"up" if cloud_ok else "DOWN"} lan={"up" if lan_ok else "DOWN"}')
 
 
 if __name__ == "__main__":
@@ -283,4 +408,8 @@ if __name__ == "__main__":
     except Exception as e:
         log(LOG_ERROR, str(e))
         log(LOG_ERROR, traceback.format_exc())
-        os.kill(os.getpid(), 9)
+        # sys.exit so the supervisor wrapper sees a non-zero exit and
+        # respawns. The previous os.kill(SIGKILL) bypassed even our own
+        # atexit handlers and looked indistinguishable from an external
+        # kill - the supervisor couldn't tell whether to restart.
+        sys.exit(1)
